@@ -1,0 +1,7 @@
+{
+  "name": "SmartShop Optimizer",
+  "description": "An intelligent grocery shopping assistant that finds the cheapest prices across nearby markets and splits your shopping list into optimized sub-lists for maximum savings.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
