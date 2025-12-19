@@ -1,8 +1,63 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
-import { GroceryItem, OptimizationResult } from "../types";
+import { GroceryItem, Market } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+/**
+ * Utilitário para pausa/delay
+ */
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+/**
+ * Wrapper para chamadas ao Gemini com Retry Exponencial
+ */
+async function callGeminiWithRetry(fn: () => Promise<any>, maxRetries = 3): Promise<any> {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      const isRateLimit = error?.message?.includes("429") || error?.status === 429 || error?.message?.includes("RESOURCE_EXHAUSTED");
+      
+      if (isRateLimit && i < maxRetries - 1) {
+        const waitTime = Math.pow(2, i) * 2000 + Math.random() * 1000;
+        console.warn(`Rate limit atingido. Tentativa ${i + 1}/${maxRetries}. Esperando ${Math.round(waitTime)}ms...`);
+        await delay(waitTime);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Sugere um nome e ícone para a lista com base nos itens
+ */
+export async function suggestListNameAndIcon(items: GroceryItem[]): Promise<{ name: string, icon: string }> {
+  const itemList = items.map(i => i.name).join(", ");
+  const prompt = `
+    Analise estes itens de compras: "${itemList}".
+    Sugira um NOME criativo e curto (max 3 palavras) para esta lista (ex: "Churrasco de Domingo", "Cabaz Semanal", "Limpeza de Casa").
+    Escolha também um NOME DE ÍCONE da biblioteca Lucide-React que combine (ex: "Flame", "Apple", "Coffee", "Droplets", "ShoppingBasket", "Beef", "Baby", "Pizza").
+    
+    RETORNA APENAS JSON:
+    { "name": "Sugestão de Nome", "icon": "NomeDoIcone" }
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: prompt,
+      config: { responseMimeType: "application/json" }
+    });
+    return JSON.parse(response.text || '{"name": "Minha Lista", "icon": "ShoppingBasket"}');
+  } catch {
+    return { name: "Nova Lista", icon: "ShoppingBasket" };
+  }
+}
 
 /**
  * Extrai itens de uma fatura em PDF e normaliza para busca global
@@ -13,18 +68,16 @@ export async function parseReceiptPdf(base64Pdf: string): Promise<string[]> {
     
     TAREFA:
     1. Analisa o PDF da fatura fornecido.
-    2. Extrai os produtos comprados, mas segue estas regras de NORMALIZAÇÃO para comparação entre lojas:
-       - REMOVE NOMES DE SUPERMERCADOS: Se o produto for marca própria (ex: "Arroz Agulha Continente", "Leite Pingo Doce", "Azeite Auchan"), extrai apenas o tipo e quantidade (ex: "Arroz Agulha 1kg").
-       - PRESERVA MARCAS COMERCIAIS: Se for uma marca independente (ex: "Leite Mimosa", "Azeite Gallo", "Coca-Cola", "Compal", "Ruffles"), MANTÉM o nome da marca.
-       - QUANTIDADE É VITAL: Garante que a quantidade (1kg, 500g, 1L) é incluída no nome do item.
-    
-    OBJECTIVO: Criar uma lista que possa ser pesquisada em QUALQUER supermercado, não apenas no que emitiu a fatura.
+    2. Extrai os produtos comprados, mas segue estas regras de NORMALIZAÇÃO:
+       - REMOVE NOMES DE SUPERMERCADOS (ex: "Continente", "Pingo Doce").
+       - PRESERVA MARCAS COMERCIAIS (ex: "Mimosa", "Gallo", "M&M's").
+       - QUANTIDADE É VITAL (ex: "1kg", "500g").
     
     RETORNA APENAS UM ARRAY JSON DE STRINGS:
     ["Produto 1", "Produto 2", ...]
   `;
 
-  try {
+  return callGeminiWithRetry(async () => {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: [
@@ -44,72 +97,50 @@ export async function parseReceiptPdf(base64Pdf: string): Promise<string[]> {
         responseMimeType: "application/json"
       }
     });
-
-    const text = response.text || "[]";
-    return JSON.parse(text);
-  } catch (error) {
-    console.error("PDF Parsing Error:", error);
-    throw new Error("Não foi possível ler a fatura. Certifique-se de que o PDF é legível.");
-  }
+    return JSON.parse(response.text || "[]");
+  });
 }
 
 /**
- * Otimiza a lista de compras cruzando com Google Shopping em múltiplos mercados
+ * Busca preços de um único item com validação de stock e retry
  */
-export async function optimizeShoppingList(
-  items: GroceryItem[],
+export async function fetchItemPrices(
+  itemName: string,
   latitude: number,
   longitude: number
-): Promise<OptimizationResult> {
-  const itemListString = items.map(i => i.name).join(", ");
-  
+): Promise<Market[]> {
   const prompt = `
-    ESTÁS A ATUAR COMO UM COMPARADOR DE PREÇOS MULTI-LOJA (GOOGLE SHOPPING PORTUGAL).
-    
-    LOCALIZAÇÃO: Latitude ${latitude}, Longitude ${longitude}.
-    
-    MISSÃO:
-    1. Para cada item: "${itemListString}", realiza uma busca global no Google Shopping.
-    2. DEVES COMPARAR O MESMO ITEM EM PELO MENOS 3 SUPERMERCADOS DIFERENTES (ex: Continente, Pingo Doce, Auchan, Lidl).
-    3. Se o item for genérico (ex: "Arroz Agulha 1kg"), encontra a opção de Marca Própria de CADA loja.
-    4. Se o item tiver marca específica (ex: "Leite Mimosa"), encontra o preço desse item exato em todas as lojas.
-    
-    DIRETRIZES DE PREÇO:
-    - Extrai preços reais de snippets de pesquisa ou Google Shopping.
-    - Prioriza a verdade do preço atual sobre qualquer dado histórico.
+    ESTÁS A ATUAR COMO UM AGENTE DE AUDITORIA DE PREÇO ÚNICO (SKU).
+    LOCALIZAÇÃO: Lat ${latitude}, Lng ${longitude}.
+    ITEM: "${itemName}"
+
+    TAREFA:
+    1. Pesquisa o preço no Google Shopping para supermercados em Portugal.
+    2. REGRA DE STOCK (OBRIGATÓRIO): Apenas inclui se estiver disponível/em stock.
+    3. Retorna JSON com os dados das lojas e o produto encontrado.
 
     RETORNA APENAS JSON:
-    {
-      "markets": [
-        {
-          "id": "slug-da-loja",
-          "name": "Nome da Loja Física Próxima",
-          "address": "Morada",
-          "lat": 38.XXXX, "lng": -9.XXXX,
-          "officialUrl": "URL",
-          "flyerUrl": "URL",
-          "products": {
-            "ItemOriginal": { 
-              "name": "Nome do SKU encontrado nessa loja", 
-              "price": 0.00, 
-              "unit": "un", 
-              "category": "Cat", 
-              "isCheapest": true,
-              "isPrivateLabel": true 
-            }
-          }
+    [
+      {
+        "id": "slug-loja",
+        "name": "Nome Loja",
+        "address": "Morada",
+        "lat": 38.X, "lng": -9.X,
+        "officialUrl": "URL",
+        "flyerUrl": "URL",
+        "product": {
+          "originalKey": "${itemName}",
+          "name": "Nome SKU",
+          "price": 0.00,
+          "unit": "un",
+          "category": "Cat",
+          "isPrivateLabel": true
         }
-      ],
-      "summary": {
-        "totalOriginalEstimate": 0.00,
-        "totalOptimizedCost": 0.00,
-        "savings": 0.00,
-        "currencySymbol": "€"
       }
-    }
+    ]
   `;
 
-  try {
+  return callGeminiWithRetry(async () => {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: prompt,
@@ -119,14 +150,10 @@ export async function optimizeShoppingList(
       }
     });
 
-    const text = response.text || "";
-    const firstBrace = text.indexOf('{');
-    const lastBrace = text.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1) throw new Error("A auditoria multi-loja falhou.");
-
+    const text = response.text || "[]";
+    const firstBrace = text.indexOf('[');
+    const lastBrace = text.lastIndexOf(']');
+    if (firstBrace === -1) return [];
     return JSON.parse(text.substring(firstBrace, lastBrace + 1));
-  } catch (error) {
-    console.error("Gemini Auditor Error:", error);
-    throw new Error("Erro na comparação multi-loja. Tente novamente.");
-  }
+  });
 }

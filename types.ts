@@ -1,3 +1,4 @@
+
 export interface GroceryItem {
   id: string;
   name: string;
@@ -34,4 +35,12 @@ export interface OptimizationResult {
     savings: number;
     currencySymbol: string;
   };
+}
+
+export interface SavedList {
+  id: string;
+  name: string;
+  iconName: string;
+  items: GroceryItem[];
+  createdAt: number;
 }
